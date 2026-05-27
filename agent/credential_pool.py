@@ -65,11 +65,13 @@ STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
+STRATEGY_STICKY_WEIGHTED = "sticky_weighted"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
+    STRATEGY_STICKY_WEIGHTED,
 }
 
 # Cooldown before retrying an exhausted credential.
@@ -395,6 +397,48 @@ def get_pool_strategy(provider: str) -> str:
     if strategy in SUPPORTED_POOL_STRATEGIES:
         return strategy
     return STRATEGY_FILL_FIRST
+
+
+def get_pool_weights(provider: str) -> Dict[str, float]:
+    """Return optional per-credential routing weights for a provider.
+
+    Config shape:
+
+    credential_pool_weights:
+      openai-codex:
+        primary-label-or-id: 3
+        backup-label-or-id: 1
+
+    Keys may match either a credential id or label. Invalid/non-positive
+    values are ignored and effectively fall back to weight 1.
+    """
+    config = _load_config_safe()
+    if config is None:
+        return {}
+
+    all_weights = config.get("credential_pool_weights")
+    if not isinstance(all_weights, dict):
+        return {}
+    provider_weights = all_weights.get(provider)
+    if not isinstance(provider_weights, dict):
+        return {}
+
+    weights: Dict[str, float] = {}
+    for raw_key, raw_value in provider_weights.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            weights[key] = value
+    return weights
+
+
+def _pool_weight(entry: PooledCredential, weights: Dict[str, float]) -> float:
+    return weights.get(entry.id) or weights.get(entry.label) or 1.0
 
 
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
@@ -1230,12 +1274,38 @@ class CredentialPool:
             self._persist()
         return available
 
+    def _increment_request_count(self, entry: PooledCredential) -> PooledCredential:
+        """Record one selection for strategies that balance by usage."""
+        updated = replace(entry, request_count=entry.request_count + 1)
+        self._replace_entry(entry, updated)
+        self._persist()
+        return updated
+
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
             self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
+
+        if self._strategy == STRATEGY_STICKY_WEIGHTED:
+            current = self.current()
+            if current is not None and any(entry.id == current.id for entry in available):
+                updated = self._increment_request_count(current)
+                self._current_id = updated.id
+                return updated
+
+            weights = get_pool_weights(self.provider)
+            entry = min(
+                available,
+                key=lambda candidate: (
+                    candidate.request_count / _pool_weight(candidate, weights),
+                    candidate.priority,
+                ),
+            )
+            updated = self._increment_request_count(entry)
+            self._current_id = updated.id
+            return updated
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)

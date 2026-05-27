@@ -790,23 +790,33 @@ def setup_model_provider(config: dict, *, quick: bool = False):
                 print_info(f"Provider pool now has {entry_count} credential(s).")
 
             if entry_count > 1:
-                strategy_labels = [
+                strategy_options = [
                     "Fill-first / sticky — keep using the first healthy credential until it is exhausted",
                     "Round robin — rotate to the next healthy credential after each selection",
+                    "Least-used — pick the healthy credential with the lowest request count",
                     "Random — pick a random healthy credential each time",
+                    "Sticky weighted — keep the current healthy credential; new sessions balance by usage/weight",
                 ]
                 current_strategy = _get_credential_pool_strategies(config).get(selected_provider, "fill_first")
                 default_strategy_idx = {
                     "fill_first": 0,
                     "round_robin": 1,
-                    "random": 2,
+                    "least_used": 2,
+                    "random": 3,
+                    "sticky_weighted": 4,
                 }.get(current_strategy, 0)
                 strategy_idx = prompt_choice(
                     "Select same-provider rotation strategy:",
-                    strategy_labels,
+                    strategy_options,
                     default_strategy_idx,
                 )
-                strategy_value = ["fill_first", "round_robin", "random"][strategy_idx]
+                strategy_value = [
+                    "fill_first",
+                    "round_robin",
+                    "least_used",
+                    "random",
+                    "sticky_weighted",
+                ][strategy_idx]
                 _set_credential_pool_strategy(config, selected_provider, strategy_value)
                 print_success(f"Saved {selected_provider} rotation strategy: {strategy_value}")
         except Exception as exc:
