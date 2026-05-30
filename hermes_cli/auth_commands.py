@@ -18,7 +18,6 @@ from agent.credential_pool import (
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
-    STRATEGY_STICKY_WEIGHTED,
     PooledCredential,
     _exhausted_until,
     _normalize_custom_pool_name,
@@ -728,13 +727,7 @@ def _interactive_reset() -> None:
 def _interactive_strategy() -> None:
     provider = _pick_provider("Provider to set strategy for")
     current = get_pool_strategy(provider)
-    strategies = [
-        STRATEGY_FILL_FIRST,
-        STRATEGY_ROUND_ROBIN,
-        STRATEGY_LEAST_USED,
-        STRATEGY_RANDOM,
-        STRATEGY_STICKY_WEIGHTED,
-    ]
+    strategies = [STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN, STRATEGY_LEAST_USED, STRATEGY_RANDOM]
 
     print(f"\nCurrent strategy for {provider}: {current}")
     print()
@@ -743,14 +736,13 @@ def _interactive_strategy() -> None:
         STRATEGY_ROUND_ROBIN: "Cycle through keys evenly",
         STRATEGY_LEAST_USED: "Always pick the least-used key",
         STRATEGY_RANDOM: "Random selection",
-        STRATEGY_STICKY_WEIGHTED: "Keep current key; new sessions pick lowest usage/weight ratio",
     }
     for i, s in enumerate(strategies, 1):
         marker = " ←" if s == current else ""
         print(f"  {i}. {s:15s} — {descriptions.get(s, '')}{marker}")
 
     try:
-        raw = input("\nStrategy [1-5]: ").strip()
+        raw = input("\nStrategy [1-4]: ").strip()
     except (EOFError, KeyboardInterrupt):
         return
     if not raw:
