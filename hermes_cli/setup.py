@@ -305,7 +305,7 @@ def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list
     appended at the end — the user toggles items with Space and confirms
     with Enter on "Continue →".
 
-    Falls back to a numbered toggle interface when simple_term_menu is
+    Falls back to a numbered toggle interface when curses is
     unavailable.
 
     Returns:
@@ -501,7 +501,6 @@ def _print_setup_summary(config: dict, hermes_home):
             tool_status.append(("Text-to-Speech (NeuTTS — not installed)", False, "run 'hermes setup tts'"))
     elif tts_provider == "kittentts":
         try:
-            import importlib.util
             kittentts_ok = importlib.util.find_spec("kittentts") is not None
         except Exception:
             kittentts_ok = False
@@ -913,9 +912,6 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     # Tool Gateway prompt is already shown by _model_flow_nous() above.
     save_config(config)
 
-    if not quick and selected_provider != "nous":
-        _setup_tts_provider(config)
-
 
 # =============================================================================
 # Section 1b: TTS Provider Configuration
@@ -1263,7 +1259,6 @@ def _setup_tts_provider(config: dict):
     elif selected == "kittentts":
         # Check if already installed
         try:
-            import importlib.util
             already_installed = importlib.util.find_spec("kittentts") is not None
         except Exception:
             already_installed = False
@@ -1351,29 +1346,9 @@ def setup_terminal_backend(config: dict):
     if selected_backend == "local":
         print_success("Terminal backend: Local")
         print_info("Commands run directly on this machine.")
-
-        # Gateway/cron working directory
-        print()
-        print_info("Gateway working directory:")
-        print_info("  Used by Telegram/Discord/cron sessions.")
-        print_info("  CLI/TUI always uses your launch directory instead.")
-        current_cwd = cfg_get(config, "terminal", "cwd", default="")
-        cwd = prompt("  Gateway working directory", current_cwd or str(Path.home()))
-        if cwd:
-            config["terminal"]["cwd"] = cwd
-
-        # Sudo support
-        print()
-        existing_sudo = get_env_value("SUDO_PASSWORD")
-        if existing_sudo:
-            print_info("Sudo password: configured")
-        elif prompt_yes_no(
-            "Enable sudo support? (stores password for apt install, etc.)", False
-        ):
-            sudo_pass = prompt("  Sudo password", password=True)
-            if sudo_pass:
-                save_env_value("SUDO_PASSWORD", sudo_pass)
-                print_success("Sudo password saved")
+        # Gateway working directory defaults to home; sudo stays off. Both are
+        # configurable later via `hermes setup terminal` / config.yaml.
+        config["terminal"].setdefault("cwd", str(Path.home()))
 
     elif selected_backend == "docker":
         print_success("Terminal backend: Docker")
@@ -1386,13 +1361,10 @@ def setup_terminal_backend(config: dict):
         else:
             print_info(f"Docker found: {docker_bin}")
 
-        # Docker image
-        current_image = cfg_get(config, "terminal", "docker_image", default="nikolaik/python-nodejs:python3.11-nodejs20")
-        image = prompt("  Docker image", current_image)
-        config["terminal"]["docker_image"] = image
-        save_env_value("TERMINAL_DOCKER_IMAGE", image)
-
-        _prompt_container_resources(config)
+        # Image and resource limits use defaults; tune via `hermes setup terminal`.
+        config["terminal"].setdefault(
+            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+        )
 
     elif selected_backend == "singularity":
         print_success("Terminal backend: Singularity/Apptainer")
@@ -1407,12 +1379,11 @@ def setup_terminal_backend(config: dict):
         else:
             print_info(f"Found: {sing_bin}")
 
-        current_image = cfg_get(config, "terminal", "singularity_image", default="docker://nikolaik/python-nodejs:python3.11-nodejs20")
-        image = prompt("  Container image", current_image)
-        config["terminal"]["singularity_image"] = image
-        save_env_value("TERMINAL_SINGULARITY_IMAGE", image)
-
-        _prompt_container_resources(config)
+        # Image and resource limits use defaults; tune via `hermes setup terminal`.
+        config["terminal"].setdefault(
+            "singularity_image",
+            "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+        )
 
     elif selected_backend == "modal":
         print_success("Terminal backend: Modal")
@@ -1511,8 +1482,6 @@ def setup_terminal_backend(config: dict):
                 if token_secret:
                     save_env_value("MODAL_TOKEN_SECRET", token_secret)
 
-        _prompt_container_resources(config)
-
     elif selected_backend == "daytona":
         print_success("Terminal backend: Daytona")
         print_info("Persistent cloud development environments.")
@@ -1562,13 +1531,10 @@ def setup_terminal_backend(config: dict):
                 save_env_value("DAYTONA_API_KEY", api_key)
                 print_success("    Configured")
 
-        # Daytona image
-        current_image = cfg_get(config, "terminal", "daytona_image", default="nikolaik/python-nodejs:python3.11-nodejs20")
-        image = prompt("  Sandbox image", current_image)
-        config["terminal"]["daytona_image"] = image
-        save_env_value("TERMINAL_DAYTONA_IMAGE", image)
-
-        _prompt_container_resources(config)
+        # Image and resource limits use defaults; tune via `hermes setup terminal`.
+        config["terminal"].setdefault(
+            "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+        )
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
@@ -1635,7 +1601,7 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 90
+    config.setdefault("agent", {})["max_turns"] = 150
     # config.yaml is the authoritative source for max_turns; the gateway
     # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
     # to .env to avoid the dual-source inconsistency that caused the
@@ -1647,18 +1613,17 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("compression", {})["enabled"] = True
     config["compression"]["threshold"] = 0.50
 
-    config.setdefault("session_reset", {}).update({
-        "mode": "both",
-        "idle_minutes": 1440,
-        "at_hour": 4,
-    })
+    # Default to never auto-resetting sessions. The gateway treats absent
+    # session_reset as "both", so we must write "none" explicitly to make
+    # the no-auto-reset default actually take effect.
+    config.setdefault("session_reset", {})["mode"] = "none"
 
     save_config(config)
     print_success("Applied recommended defaults:")
-    print_info("  Max iterations: 90")
+    print_info("  Max iterations: 150")
     print_info("  Tool progress: all")
     print_info("  Compression threshold: 0.50")
-    print_info("  Session reset: inactivity (1440 min) + daily (4:00)")
+    print_info("  Session reset: never (use /reset or compression)")
     print_info("  Run `hermes setup agent` later to customize.")
 
 
@@ -3206,10 +3171,14 @@ def run_setup_wizard(args):
         if migration_ran:
             config = load_config()
 
-        setup_mode = prompt_choice("How would you like to set up Hermes?", [
-            "Quick setup — provider, model & messaging (recommended)",
-            "Full setup — configure everything",
-        ], 0)
+        setup_mode = prompt_choice(
+            "How would you like to set up Hermes?",
+            [
+                "Quick Setup (Nous Portal) — free OAuth login, no API keys, model + tools (recommended)",
+                "Full setup — configure every provider, tool & option yourself (bring your own keys)",
+            ],
+            0,
+        )
 
         if setup_mode == 0:
             _run_first_time_quick_setup(config, hermes_home, is_existing)
@@ -3238,9 +3207,11 @@ def run_setup_wizard(args):
     if not (migration_ran and _skip_configured_section(config, "terminal", "Terminal Backend")):
         setup_terminal_backend(config)
 
-    # Section 3: Agent Settings
-    if not (migration_ran and _skip_configured_section(config, "agent", "Agent Settings")):
-        setup_agent_settings(config)
+    # Section 3: Agent Settings — no longer prompted. First installs get the
+    # recommended defaults silently; existing installs keep whatever they have.
+    # Tune later with `hermes setup agent`.
+    if not is_existing:
+        _apply_default_agent_settings(config)
 
     # Section 4: Messaging Platforms
     if not (migration_ran and _skip_configured_section(config, "gateway", "Messaging Platforms")):
@@ -3260,13 +3231,43 @@ def run_setup_wizard(args):
 
 
 def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
-    """Streamlined first-time setup: provider, model, terminal & messaging.
+    """Streamlined first-time setup via Nous Portal: OAuth, model, terminal & messaging.
 
-    Applies sensible defaults for TTS (Edge), agent settings, and tools —
-    the user can customize later via ``hermes setup <section>``.
+    Routes straight to the Nous Portal provider — runs the device-code OAuth
+    login, picks a Nous model, then configures the terminal backend and (optionally)
+    a messaging platform. Applies sensible defaults for everything else (agent
+    settings, tools); the user can customize later via ``hermes setup <section>``
+    or switch providers with ``hermes model``.
     """
-    # Step 1: Model & Provider (essential — skips rotation/vision/TTS)
-    setup_model_provider(config, quick=True)
+    from hermes_cli.config import load_config
+
+    # Step 1: Nous Portal — OAuth login + model selection.
+    # _model_flow_nous() handles both the logged-out path (device-code OAuth,
+    # which selects a model internally) and the already-logged-in path (curated
+    # Nous model picker). Provider is set to "nous" by the login/model save.
+    print()
+    print_header("Nous Portal")
+    print_info("One subscription, 300+ models, plus the Tool Gateway:")
+    print_info("  web search, image generation, TTS, browser automation.")
+    print_info("Sign up: https://portal.nousresearch.com/manage-subscription")
+    print()
+    try:
+        from hermes_cli.main import _model_flow_nous
+        _model_flow_nous(config)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        print_info("Nous Portal setup cancelled.")
+    except Exception as exc:
+        logger.debug("_model_flow_nous error during quick setup: %s", exc)
+        print_warning(f"Nous Portal setup encountered an error: {exc}")
+        print_info("You can try again later with: hermes model")
+
+    # Re-sync the wizard's config dict from disk — _model_flow_nous (and the
+    # underlying login/model save) write via their own load/save cycle, and the
+    # wizard's later save_config(config) must not clobber those values (#4172).
+    _refreshed = load_config()
+    config.clear()
+    config.update(_refreshed)
 
     # Step 2: Terminal Backend — where commands run is a core decision
     setup_terminal_backend(config)
