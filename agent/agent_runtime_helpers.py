@@ -49,7 +49,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
 )
 
 
@@ -445,6 +445,45 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     return repairs
 
 
+def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
+    """Run :func:`repair_message_sequence` and keep the SessionDB flush
+    cursor consistent with the compacted list (#44837).
+
+    ``repair_message_sequence`` merges/drops messages in place, shrinking
+    the list. ``_last_flushed_db_idx`` (the DB-write cursor) indexes into
+    that list, so after compaction it can point past the new end — the
+    turn-end flush would then skip the assistant/tool chain entirely — or
+    past unflushed messages shifted to lower indexes.
+
+    Repair preserves object identity for surviving messages, so counting
+    the survivors from the previously-flushed prefix gives the exact new
+    cursor even when messages are dropped/merged at indexes *before* the
+    cursor — a plain ``min()`` clamp would silently skip that many
+    unflushed rows. Falls back to the clamp when no prefix snapshot is
+    available.
+
+    Returns the number of repairs made (same as ``repair_message_sequence``).
+    """
+    pre_repair_flushed_ids = None
+    flush_cursor = getattr(agent, "_last_flushed_db_idx", None)
+    if isinstance(flush_cursor, int) and flush_cursor > 0:
+        pre_repair_flushed_ids = {id(m) for m in messages[:flush_cursor]}
+
+    repairs = repair_message_sequence(agent, messages)
+
+    if repairs > 0 and hasattr(agent, "_last_flushed_db_idx"):
+        if pre_repair_flushed_ids is not None:
+            agent._last_flushed_db_idx = sum(
+                1 for m in messages if id(m) in pre_repair_flushed_ids
+            )
+        else:
+            agent._last_flushed_db_idx = min(
+                agent._last_flushed_db_idx, len(messages)
+            )
+
+    return repairs
+
+
 
 def strip_think_blocks(agent, content: str) -> str:
     """Remove reasoning/thinking blocks from content, returning only visible text.
@@ -679,15 +718,28 @@ def recover_with_credential_pool(
         # long-running TUI sessions stuck on stale tokens until the user
         # exited and reopened.
         is_entitlement = agent._is_entitlement_failure(error_context, status_code)
+        _auth_haystack = " ".join(
+            str(error_context.get(k) or "").lower()
+            for k in ("message", "reason", "code", "error")
+            if isinstance(error_context, dict)
+        )
+        if (
+            not is_entitlement
+            and status_code == 403
+            and "oauth authentication is currently not allowed for this organization" in _auth_haystack
+        ):
+            is_entitlement = True
+        if (
+            not is_entitlement
+            and status_code == 403
+            and (agent.provider or "") == "anthropic"
+            and getattr(agent, "api_mode", "") == "anthropic_messages"
+        ):
+            is_entitlement = True
         if not is_entitlement and status_code == 403 and (agent.provider or "") == "xai-oauth":
-            _disambiguator_haystack = " ".join(
-                str(error_context.get(k) or "").lower()
-                for k in ("message", "reason", "code", "error")
-                if isinstance(error_context, dict)
-            )
             _is_xai_auth_failure = (
-                "[wke=unauthenticated:" in _disambiguator_haystack
-                or "oauth2 access token could not be validated" in _disambiguator_haystack
+                "[wke=unauthenticated:" in _auth_haystack
+                or "oauth2 access token could not be validated" in _auth_haystack
             )
             if not _is_xai_auth_failure:
                 is_entitlement = True
@@ -1784,6 +1836,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "read_terminal":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
+            return _finish_agent_tool(
+                _read_terminal_tool(
+                    start_line=next_args.get("start_line"),
+                    count=next_args.get("count"),
+                    callback=getattr(agent, "read_terminal_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
@@ -1843,6 +1906,27 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     import re
     from difflib import get_close_matches
 
+    if not tool_name:
+        return None
+
+    # VolcEngine api/plan workaround (issue #33007): the endpoint's
+    # protocol-translation layer occasionally leaks raw XML attribute
+    # fragments into tool_use.name, e.g.
+    #   `terminal" parameter="command" string="true`
+    #   `execute_code" parameter="code" string="true`
+    #   `session_search" parameter="session_id" string="true`
+    # We trim at the first unambiguous XML/quote character so the rest
+    # of the repair pipeline (lowercase / snake_case / fuzzy match)
+    # can resolve the cleaned name to a real tool.
+    #
+    # Crucially we DO NOT split on whitespace: legitimate inputs like
+    # "write file" must keep flowing through ``_norm`` -> ``write_file``
+    # (covered by test_space_to_underscore in
+    # tests/run_agent/test_repair_tool_call_name.py).
+    for _xml_sep in ('"', "'", "<", ">"):
+        _idx = tool_name.find(_xml_sep)
+        if _idx > 0:
+            tool_name = tool_name[:_idx]
     if not tool_name:
         return None
 
